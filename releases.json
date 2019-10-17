@@ -1,0 +1,37 @@
+{
+  "0.0.1": {
+    "hash": "/ipfs/QmdJxWTx6cD81tW4JGGKXReKmSqnqJEMsUhbxr65YPwcFH",
+    "type": "manifest",
+    "uploadedTo": {
+      "dappnode": "Wed, 16 Oct 2019 05:54:59 GMT"
+    }
+  },
+  "0.0.2": {
+    "hash": "/ipfs/QmUn2LV8ojfLS3BtfWwNJxzXtCzFf3FAXGBvBxKPBTtZv9",
+    "type": "manifest",
+    "uploadedTo": {
+      "dappnode": "Wed, 16 Oct 2019 09:21:56 GMT"
+    }
+  },
+  "0.0.3": {
+    "hash": "/ipfs/QmakgRSHDKpEQYDpWiatQNSLgvhFTFpwvzM8uhbnSMavxx",
+    "type": "manifest",
+    "uploadedTo": {
+      "dappnode": "Wed, 16 Oct 2019 13:52:06 GMT"
+    }
+  },
+  "0.0.4": {
+    "hash": "/ipfs/QmbmeepQWGLp2JhRMdvgUMEhn2V1BaiyBxjmDLRph7FJFQ",
+    "type": "manifest",
+    "uploadedTo": {
+      "dappnode": "Wed, 16 Oct 2019 22:29:03 GMT"
+    }
+  },
+  "0.0.5": {
+    "hash": "/ipfs/QmRoYPYghi9KaB3GStPdAb8Mp5V4q823rF4uPgv8AyuyQK",
+    "type": "manifest",
+    "uploadedTo": {
+      "dappnode": "Thu, 17 Oct 2019 04:42:33 GMT"
+    }
+  }
+}

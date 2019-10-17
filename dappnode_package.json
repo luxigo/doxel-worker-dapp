@@ -1,0 +1,27 @@
+{
+  "name": "doxel-worker.public.dappnode.eth",
+  "version": "0.0.6",
+  "description": "Pictures post-processing worker for doxel",
+  "avatar": "/ipfs/QmQvaHrBvH9P6khtU1cz4xvnW4vAuQa5kQi2ATQ9ueAoWk",
+  "type": "service",
+  "image": {
+    "path": "doxel-worker.public.dappnode.eth_0.0.5.tar.xz",
+    "hash": "/ipfs/QmawpyGnPtHyxXAsDoySzybbrdC8NKHQvfhSZwPhTCJq7t",
+    "size": 795002060,
+    "external_vol": [
+      "doxelpublicdappnodeeth_doxel-images:/mnt"
+    ],
+    "ports": [],
+    "environment": [],
+    "restart": "always"
+  },
+  "dependencies": {},
+  "author": "luc.deschenaux@freesurf.ch",
+  "categories": [
+    "Photogrammetry"
+  ],
+  "links": {
+    "homepage": "https://github.com/doxel"
+  },
+  "license": "AGPL-v3.0-or-later"
+}

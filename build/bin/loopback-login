@@ -1,0 +1,107 @@
+#!/bin/bash
+
+usage() {
+cat << EOF
+NAME
+       $(basename $0) - login to loopbackjs backend
+
+SYNOPSIS
+       $(basename $0) [OPTION]... URL
+
+DESCRIPTION
+       Return the accesstoken json after successful login, using username or
+       email, and password.
+
+       URL
+             the api endpoint eg "http://localhost:3001/api"
+
+       -h, --help
+
+       -u, --username
+
+       -e, --email
+
+       -p, --password
+
+       -n, --no-check-certificate
+
+EOF
+exit 1
+
+}
+
+
+# parse command line options
+if ! options=$(getopt -o hu:e:p:n -l help,username:,email:,password:,no-check-certificate -- "$@")
+then
+    # something went wrong, getopt will put out an error message for us
+    exit 1
+fi
+
+eval set -- "$options"
+
+while [ $# -gt 0 ] ; do
+    case $1 in
+    -h|--help) usage ;;
+    -u|--username) LB_USERNAME=$2 ; shift ;;
+    -e|--email) EMAIL=$2 ; shift ;;
+    -p|--password) PASSWORD=$2 ; shift ;;
+    -n|--no-check-certificate) NOCHECKCERTIFICATE=--no-check-certificate ;;
+    (--) shift; break;;
+    (-*) echo "$(basename $0): error - unrecognized option $1" 1>&2; exit 1;;
+    (*) break;;
+    esac
+    shift
+done
+
+[ $# -ne 1 ] && usage
+URL=$1/users/login
+
+[ -n "$LB_USERNAME" ] && LB_USERID="username=$LB_USERNAME"
+[ -n "$EMAIL" ] && LB_USERID="email=$EMAIL"
+[ -n "$LB_USERID" -a -n "$PASSWORD" ] && CREDENTIALS="$LB_USERID&password=$PASSWORD"
+if [ -z "$CREDENTIALS" ] ; then
+  if [ -z "$LB_USERID" ] ; then 
+    while [ -z "$LB_USERID" ] ; do
+      read -p "login: " LB_USERID
+    done
+    if grep -q @ <<< $LB_USERID ; then
+      LB_USERID="email=$LB_USERID"
+    else
+      LB_USERID="username=$LB_USERID"
+    fi
+  fi
+  while [ -z "$PASSWORD" ] ; do
+    read -s -p "password: "  PASSWORD
+  done
+  echo >&2
+  CREDENTIALS="$LB_USERID&password=$PASSWORD"
+fi
+
+wget \
+  -q \
+  --post-data "$CREDENTIALS" \
+  --header="Content-Type: application/x-www-form-urlencoded" \
+  $NOCHECKCERTIFICATE \
+  $URL \
+  -O -
+
+ERR=$?
+
+echo
+
+ERRMSG=(\
+  'Ok' \
+  'Generic error code' \
+  'Parse error' \
+  'File I/O error' \
+  'Network failure' \
+  'SSL verification failure' \
+  'Username/password authentication failure' \
+  'Protocol errors' \
+  'Server issued an error response'
+)
+
+[ $ERR -ne 0 ] && echo "$(basename 0): ${ERRMSG[$ERR]} ($ERR)" >&2
+
+exit $ERR

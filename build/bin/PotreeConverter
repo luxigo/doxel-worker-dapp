@@ -1,0 +1,4 @@
+#!/bin/bash
+cd ~/src/PotreeConverter/build/PotreeConverter/
+export PATH=$PATH:~/src/PotreeConverter/build/PotreeConverter/
+exec ./PotreeConverter "$@"

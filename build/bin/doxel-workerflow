@@ -1,0 +1,972 @@
+#/bin/bash
+
+# Copyright (C) 2017-2019 Alsenet SA
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License,
+# or (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU Affero General Public License for more details.
+
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see http://www.gnu.org/licenses/.
+
+DATE_FORMAT="%b %d %Y %H:%M:%S"
+DOXELCONFIG=~/.doxelconfig
+
+usage() {
+cat << EOF
+NAME
+       $(basename $0) - process one job
+
+SYNOPSIS
+       $(basename $0) [OPTION]... URL
+
+DESCRIPTION
+       Process a queued segment, or the segment specified with -s
+
+       A worker can process only one job at a time: if a non completed
+       job is found for the user, the same job will be run again, or an
+       error will be thrown (if a another segment has been specified).
+
+       You can set environment variables in ~/.doxelconfig or the file
+       specified with option --config (see ENVIRONMENT VARIABLES below)
+
+       You can override default options with (in order), environment variables
+       and command line parameters.
+
+       If no credentials are found in the config file, environment variables,
+       and command line parameters, the login and password will be asked.
+
+       URL
+             the api endpoint eg "http://localhost:3001/api"
+
+       -h, --help
+
+       -n, --no-check-certificate
+
+       -c, --config
+             config to use instead of ~/.doxelconfig
+
+       -u, --username
+             worker username
+
+       -p, --password
+             worker password
+
+       -a, --authorization
+             worker access token id, if already logged in
+
+       -s, --segment
+             the segment id or timestamp
+
+       -w, --sensor-width-database
+             the sensor width database. Do not create custom databases,
+             update the main file instead.
+
+       -f, --force
+          delete previous results
+
+ENVIRONMENT VARIABLES
+       The following environment variables can optionally be set in
+       the config file, the shell or on the command line:
+
+         API
+            the REST api URL
+
+         ACCESS_TOKEN
+            the access token
+
+         AUTHORIZATION
+            the access token id
+
+         LB_USERNAME
+            the user name (needs to have role 'worker' or 'admin')
+
+         PASSWORD
+            the password
+
+         NOCHECKCERTIFICATE
+            ignore https certificate when set to --no-check-certificate
+
+         SENSOR_WIDTH_DB
+
+         DOCKER_DEFAULTS
+
+         DOCKER_OPTIONS
+
+         NUM_THREADS
+
+         SFMINIT_IMAGELISTING_OPTIONS
+
+         COMPUTEFEATURES_OPTIONS
+
+         COMPUTEMATCHES_OPTIONS
+
+         GLOBALSFM_OPTIONS
+
+         COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS
+
+         OPENMVG2PMVS_OPTIONS
+
+EOF
+exit 1
+
+}
+
+# parse command line options
+if ! options=$(getopt -o ha:ns:,w:,u:,p:,D:,d:,t: -l help,authorization:,no-check-certificate,segment,sensor-width-database:,username:,password:,docker-defaults:,docker-options:,threads: -- "$@")
+then
+    # something went wrong, getopt will put out an error message for us
+    exit 1
+fi
+
+eval set -- "$options"
+
+while [ $# -gt 0 ] ; do
+    case $1 in
+    -h|--help) usage ;;
+    -a|--authorization) AUTHORIZATION=$2 ; shift ;;
+    -n|--no-check-certificate) NOCHECKCERTIFICATE=--no-check-certificate ;;
+    -s|--segment) SEGMENT_ID="$2" ; shift ;;
+    -w|--sensor-width-database) SENSOR_WIDTH_DB=$2 ; shift ;;
+    -u|--username) LB_USERNAME=$2 ; shift ;;
+    -p|--password) PASSWORD=$2 ; shift ;;
+    -D|--docker-defaults) DOCKER_DEFAULTS=$2 ; shift ;;
+    -d|--docker-options) DOCKER_OPTIONS=$2 ; shift ;;
+    -t|--threads) NUM_THREADS=$2 ; shift ;;
+    -c|--config) DOXELCONFIG=$2 ; shift ;;
+    (--) shift; break;;
+    (-*) echo "$(basename $0): error - unrecognized option $1" 1>&2; exit 1;;
+    (*) break;;
+    esac
+    shift
+done
+
+if [ -f "$DOXELCONFIG" ] ; then
+   . $DOXELCONFIG
+else
+  if [ "$DOXELCONFIG" != ~/.doxelconfig ] ; then
+    echo "file not found: $DOXELCONFIG"
+    exit 1
+  fi
+fi
+
+if [ $# -eq 1 ] ; then
+  API=$1
+fi
+
+SENSOR_WIDTH_DB=${SENSOR_WIDTH_DB:-/usr/share/openMVG/sensor_width_camera_database.txt}
+NUM_THREADS=${NUM_THREADS:-$(nproc)}
+
+URL=${API:-http://localhost:3001/api}
+LB_USERNAME=${LB_USERNAME:-worker}
+PASSWORD=${PASSWORD:-worker}
+export DOCKER_DEFAULTS=${DOCKER_DEFAULTS:-"-v /mnt:/mnt -it --rm=true --cpus=$NUM_THREADS"}
+
+REQUIRED_POINTS_AFTER_OPENMVG=${REQUIRED_POINTS_AFTER_OPENMVG:-10}
+REQUIRED_POINTS_AFTER_DENSIFICATION=${REQUIRED_POINTS_AFTER_DENSIFICATION:-5000}
+
+assert_dependencies() {
+  for cmd in node jq parallel mogrify exiftool ts ; do
+    if ! which $cmd > /dev/null ; then
+      echo Command $cmd is required !
+      exit 1
+    fi
+  done
+}
+
+encodeURIComponent() {
+  node -e "console.log(encodeURIComponent('$*'))"
+}
+
+errmsg() {
+  echo "*** ERROR: $*" >&2
+  log '{"error": true, "msg": "'$*'", "t": '$(date +%s000)'}'
+  exit 1
+}
+
+progress() {
+  printf %s\\r "=== $*" >&2
+  [ "$*" != "$PREVPROGRESS" ] && printf \\n
+  PREVPROGRESS="$*"
+  log '{"msg": "'$*'", "t": '$(date +%s000)'}'
+}
+
+log() {
+  if [ -n "$AUTHORIZATION" -a -n "$JOB_ID" -a "$JOB_ID"!="null" ] ; then
+    doxel-progress \
+      --no-check-certificate \
+      -a $AUTHORIZATION \
+      -j $JOB_ID \
+      -d $(encodeURIComponent "${*}") \
+      $URL > /dev/null
+  fi
+
+#  [ -n "$SEGMENT_DIR" ] && echo "$*" >> $SEGMENT_DIR/LOG
+}
+
+assert_dependencies
+
+# login
+
+if [ -z "$AUTHORIZATION" ] ; then
+  if [ -z "$ACCESS_TOKEN" ] ; then
+    ACCESS_TOKEN=$( \
+      loopback-login \
+        -u $LB_USERNAME \
+        -p $PASSWORD \
+        $NOCHECKCERTIFICATE \
+        $API \
+    )
+    [ -z "$ACCESS_TOKEN" ] && errmsg login failed 2>&1 | ts "$DATE_FORMAT"
+
+  fi
+  AUTHORIZATION=$(jq -r .id <<< $ACCESS_TOKEN)
+fi
+
+if [ -z "$AUTHORIZATION" ] ; then
+  echo unauthorized >&2
+  exit
+fi
+
+# get job info
+if [ -n "$SEGMENT_ID" ] ; then
+  RESULT=$(doxel-getjob -s $SEGMENT_ID -a $AUTHORIZATION $URL)
+else
+  RESULT=$(doxel-getjob -a $AUTHORIZATION $URL)
+fi
+EXITCODE=$?
+
+[ $EXITCODE -ne 0 ] && errmsg doxel-getjob returned error $EXITCODE 2>&1 | ts "$DATE_FORMAT"
+
+[ -z "$RESULT" ] && errmsg no reply 2>&1 | ts "$DATE_FORMAT"
+
+jq -r . <<< $RESULT
+
+if [ "$RESULT" == "{}" ] ; then
+  progress No job available 2>&1 | ts "$DATE_FORMAT"
+  exit
+fi
+
+JOB_ID=$(jq -r .result.job.id <<< $RESULT)
+[ "$JOB_ID" == "null" ] && errmsg no job id 2>&1 | ts "$DATE_FORMAT"
+
+SEGMENT_ID=$(jq -r .result.job.segmentId <<< $RESULT)
+[ "$SEGMENT_ID" == "null" ] && errmsg no segment id 2>&1 | ts "$DATE_FORMAT"
+echo "=== Segment: $SEGMENT_ID"
+
+SEGMENT_DIR=$( \
+  doxel-segment-path -s $SEGMENT_ID -a $AUTHORIZATION $URL \
+  | sed -r -e 's/.*\/upload/\/mnt\/upload/' \
+)
+
+[ -z "$SEGMENT_DIR" ] && errmsg no segment dir 2>&1 | ts "$DATE_FORMAT"
+JOB_DIR=$SEGMENT_DIR/job/$JOB_ID
+mkdir -p $JOB_DIR || errmsg cannot create dir $JOB_DIR 2>&1 | ts "$DATE_FORMAT"
+
+add() {
+  local type=$1
+  local option=$2
+  local path=$3
+  local result=$(jq -r $path <<< $RESULT | sed -e s/^null//)
+  [ "${option: -1}" = '=' ] || option="$option "
+  case $type in
+    float) result=${result//[^0-9\.]/} ;;
+    floats) result=${result//[^0-9\.;]/} ;;
+    int) result=${result//[^0-9]/} ;;
+    alpha)
+      result=${result//[^a-zA-Z_0-9|]/}
+      [ "$result" == '' ] && unset result
+    ;; 
+    switch)
+      result=${result//[^a-z0-9]}
+      case "$result" in
+        false|0|'') return ;;
+        *) O="$O $option" ; return ;;
+      esac
+      ;;
+    *) result=${result//[^$type]/} ;;
+  esac
+  [ -n "$result" ] && O="$O $option$result"
+}
+
+{
+
+if [ -z "$SFMINIT_IMAGELISTING_OPTIONS" ] ; then
+  O=""
+  add float --focal .result.job.config.openmvg.sfm_imagelisting.focal
+  add floats --intrinsics .result.job.config.openmvg.sfm_imagelisting.intrinsics
+  add int --camera_model .result.job.config.openmvg.sfm_imagelisting.camera_model
+  add int --group_camera_model .result.job.config.openmvg.sfm_imagelisting.group_camera_model
+  add int --use_pose_prior .result.job.config.openmvg.sfm_imagelisting.use_pose_prior
+  add floats --prior_weights .result.job.config.openmvg.sfm_imagelisting.prior_weights
+  SFMINIT_IMAGELISTING_OPTIONS=$O
+fi
+
+if [ -z "$COMPUTEFEATURES_OPTIONS" ] ; then
+  O=""
+  add alpha --describerMethod .result.job.config.openmvg.computefeatures.describer_method
+  add int --upright .result.job.config.openmvg.computefeatures.upright
+  add alpha --describerPreset .result.job.config.openmvg.computefeatures.describer_preset
+  add int --numThreads .result.job.config.openmvg.computefeatures.numThreads
+  COMPUTEFEATURES_OPTIONS=$O
+fi
+
+if [ -z "$COMPUTEMATCHES_OPTIONS" ] ; then
+  O=""
+  add float --ratio .result.job.config.openmvg.computematches.ratio
+  add fehao --geometric_model .result.job.config.openmvg.computematches.geometric_model
+  add int --video_mode_matching .result.job.config.openmvg.computematches.video_mode_matching
+  add alpha --nearest_matching_method .result.job.config.openmvg.computematches.nearest_matching_method
+  add switch --guided_matching .result.job.config.openmvg.computematches.guided_matching
+  add int --cache_size .result.job.config.openmvg.computematches.cache_size
+  COMPUTEMATCHES_OPTIONS=$O
+fi
+
+if [ -z "$GLOBALSFM_OPTIONS" ] ; then
+  O=""
+  add int --rotationAveraging .result.job.config.openmvg.globalsfm.rotation_averaging
+  add int --translationAveraging= .result.job.config.openmvg.globalsfm.translation_averaging
+  add alpha --refine_intrinsics .result.job.config.openmvg.globalsfm.refine_intrinsics
+  add switch prior_usage .result.job.config.openmvg.globalsfm.prior_usage
+  GLOBALSFM_OPTIONS=$O
+fi
+
+if [ -z "$COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS" ] ; then
+  O=""
+  add switch bundle_adjustment .result.job.config.openmvg.compute_structure_from_known_poses.bundle_adjustment
+  add float --residual_threshold .result.job.config.openmvg.compute_structure_from_known_poses.residual_threshold
+  add int --cache_size .result.job.config.openmvg.compute_structure_from_known_poses.cache_size
+  COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS=$O
+fi
+
+if [ -z "$OPENMVG2PMVS_OPTIONS" ] ; then
+  O=""
+  add float --resolution .result.job.config.openmvg.openmvg2pmvs.resolution
+  add switch --useVisData .result.job.config.openmvg.openmvg2pmvs.use_vis_data
+  add int --CPU .result.job.config.openmvg.openmvg2pmvs.CPU
+  OPENMVG2PMVS_OPTIONS=$O
+fi
+
+if [ -z "$SMVSRECON_OPTIONS" ] ; then
+  O=""
+  add float --alpha .result.job.config.smvs.smvsrecon.alpha
+  add float --scale .result.job.config.smvs.smvsrecon.scale
+  add float --output_scale .result.job.config.smvs.smvsrecon.output_scale
+  add int --threads .result.job.config.smvs.smvsrecon.threads
+  add switch --shading .result.job.config.smvs.smvsrecon.shading
+  add switch --no_cut .result.job.config.smvs.smvsrecon.no_cut
+  add int --neighbors .result.job.config.smvs.smvsrecon.neighbors
+  add int --min_neighbors .result.job.config.smvs.smvsrecon.min_neighbors
+  add switch --no_sgm .result.job.config.smvs.smvsrecon.no_sgm
+  add switch --force_sgm .result.job.config.smvs.smvsrecon.force_sgm
+  add float --sgm_scale .result.job.config.smvs.smvsrecon.sgm_scale
+  add float --sgm_range .result.job.config.smvs.smvsrecon.sgm_range
+  add switch --full_opt .result.job.config.smvs.smvsrecon.full_opt
+  add switch --clean .result.job.config.smvs.smvsrecon.clean
+  SMVSRECON_OPTIONS=$O
+fi
+
+if [ -z "$FSSRECON_OPTIONS" ] ; then
+  O=""
+  add float --scale-factor .result.job.config.smvs.fssrecon.scale_factor
+  add int --refine-octree .result.job.config.smvs.fssrecon.refine_octree
+  add float --min-scale .result.job.config.smvs.fssrecon.min_scale
+  add float --max_scale .result.job.config.smvs.fssrecon.max_scale
+  add alpha --interpolation .result.job.config.smvs.fssrecon.interpolation
+  FSSRECON_OPTIONS=$O
+fi
+
+if [ -z "$MESHCLEAN_OPTIONS" ] ; then
+  O=""
+  add float --threshold .result.job.config.smvs.meshclean.threshold
+  add float --percentile .result.job.config.smvs.meshclean.percentile
+  add float --component_size .result.job.config.smvs.meshclean.component_size
+  add switch --no_clean .result.job.config.smvs.meshclean.no_clean
+  MESCHLEAN_OPTIONS=$O
+
+fi
+
+if [ -z "$CMVS_MAXIMAGE" ] ; then
+  CMVS_MAXIMAGE=$(jq -r .result.job.config.cmvspmvs.cmvs.max_image <<< $RESULT | sed -e s/^null$//)
+  CMVS_MAXIMAGE=${CMVS_MAXIMAGE//[^0-9]\./}
+fi
+
+
+if [ -z "$CMVS_CPU" ] ; then
+  CMVS_CPU=$(jq -r .result.job.config.cmvspmvs.cmvs.cpu <<< $RESULT | sed -e s/^null$//)
+  CMVS_CPU=${CMVS_CPU//[^0-9]\./}
+fi
+
+
+if [ -z "$PMVS_LEVEL" ] ; then
+  PMVS_LEVEL=$(jq -r .result.job.config.cmvspmvs.pmvs.level <<< $RESULT | sed -e s/^null$//)
+  PMVS_LEVEL=${PMVS_LEVEL//[^0-9]\./}
+fi
+
+
+if [ -z "$PMVS_CSIZE" ] ; then
+  PMVS_CSIZE=$(jq -r .result.job.config.cmvspmvs.pmvs.csize <<< $RESULT | sed -e s/^null$//)
+  PMVS_CSIZE=${PMVS_CSIZE//[^0-9]\./}
+fi
+
+
+if [ -z "$PMVS_THRESHOLD" ] ; then
+  PMVS_THRESHOLD=$(jq -r .result.job.config.cmvspmvs.pmvs.threshold <<< $RESULT | sed -e s/^null$//)
+  PMVS_THRESHOLD=${PMVS_THRESHOLD//[^0-9]\./}
+fi
+
+
+if [ -z "$PMVS_WSIZE" ] ; then
+  PMVS_WSIZE=$(jq -r .result.job.config.cmvspmvs.pmvs.csize <<< $RESULT | sed -e s/^null$//)
+  PMVS_WSIZE=${PMVS_WSIZE//[^0-9]\./}
+fi
+
+
+if [ -z "$PMVS_MINIMAGENUM" ] ; then
+  PMVS_MINIMAGENUM=$(jq -r .result.job.config.cmvspmvs.pmvs.min_image_num <<< $RESULT | sed -e s/^null$//)
+  PMVS_MINIMAGENUM=${PMVS_MINIMAGENUM//[^0-9]\./}
+fi
+
+
+if [ -z "$PMVS_CPU" ] ; then
+  PMVS_CPU=$(jq -r .result.job.config.cmvspmvs.pmvs.cpu <<< $RESULT | sed -e s/^null$//)
+  PMVS_CPU=${PMVS_CPU//[^0-9]\./}
+fi
+
+assert_cameraModelInDatabase() {
+  progress "Looking for camera model"
+  JPEG=$(find original_images -maxdepth 1 -name \*.jpeg -print -quit)
+  MODEL=$(exiftool -j -model $JPEG | jq .[0].Model -r)
+  if [ -n "$MODEL" ] ; then
+    if grep -q -e "^$MODEL;" $SENSOR_WIDTH_DB ; then
+      progress "Found $MODEL in $SENSOR_WIDTH_DB"
+      [ -z "$focal" ] && SENSOR_WIDTH_OPTION="-d $SENSOR_WIDTH_DB"
+    else
+      if [ "$MODEL" != "null" ] ; then
+        progress "$MODEL not found in $SENSOR_WIDTH_DB"
+        if [ -z "$focal" ] ; then
+          WIDTH=$(identify -format '%w' $JPEG)
+          ESTIMATED_FOCAL=$(echo $WIDTH \* 1.2 | bc -l)
+          SENSOR_WIDTH_OPTION="-f $ESTIMATED_FOCAL"
+        fi
+      else
+        progress "Camera model not found in EXIF for $JPEG"
+        WIDTH=$(identify -format '%w' $JPEG)
+        ESTIMATED_FOCAL=$(echo $WIDTH \* 1.2 | bc -l)
+        SENSOR_WIDTH_OPTION="-f $ESTIMATED_FOCAL"
+      fi
+    fi
+  else
+    progress "Camera model not found in EXIF for $JPEG"
+    WIDTH=$(identify -format '%w' $JPEG)
+    ESTIMATED_FOCAL=$(echo $WIDTH \* 1.2 | bc -l)
+    SENSOR_WIDTH_OPTION="-f $ESTIMATED_FOCAL"
+  fi
+}
+
+sfm_init() {
+  if [ -z "$FORCE" -a -f $SEGMENT_DIR/openMVG/sfm_data.json ]
+  then
+    progress "Images list already exist"
+  else
+    FORCE=true
+    [ -n "$FORCE" -a -f $SEGMENT_DIR/openMVG/sfm_data.json ] && rm $SEGMENT_DIR/openMVG/sfm_data.json
+    progress openMVG_main_SfMInit_ImageListing
+    mkdir -p $SEGMENT_DIR/openMVG
+    SFMINIT_IMAGELISTING_OPTIONS=${SFMINIT_IMAGELISTING_OPTIONS:-\
+    }
+    progress "options: $SFMINIT_IMAGELISTING_OPTIONS"
+    echo $SFMINIT_IMAGELISTING_OPTIONS > $SEGMENT_DIR/openMVG/SFMINIT_IMAGELISTING_OPTIONS
+    sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+openMVG_main_SfMInit_ImageListing \
+-i $SEGMENT_DIR/original_images \
+-o $SEGMENT_DIR/openMVG \
+$SENSOR_WIDTH_OPTION \
+$SFMINIT_IMAGELISTING_OPTIONS
+EOF
+    openMVG_main_SfMInit_ImageListing \
+      -i $SEGMENT_DIR/original_images \
+      -o $SEGMENT_DIR/openMVG \
+      $SENSOR_WIDTH_OPTION \
+      $SFMINIT_IMAGELISTING_OPTIONS
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+      [ -f $SEGMENT_DIR/openMVG/sfm_data.json ] && rm $SEGMENT_DIR/openMVG/sfm_data.json
+      errmsg "openMVG_main_SfMInit_ImageListing exited with status $EXIT_CODE"
+    fi
+  fi
+}
+
+compute_features() {
+  if [ -z "$FORCE" -a -n "$(find $SEGMENT_DIR/openMVG/matches/ -maxdepth 1 -iname \*.feat -print -quit)" ]
+  then
+    progress Features already exist
+  else
+    FORCE=true
+    progress openMVG_main_ComputeFeatures
+    COMPUTEFEATURES_OPTIONS=${COMPUTEFEATURES_OPTIONS:-\
+      -m SIFT \
+    }
+    progress "options: $COMPUTEFEATURES_OPTIONS"
+    echo $COMPUTEFEATURES_OPTIONS > $SEGMENT_DIR/openMVG/COMPUTEFEATURES_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+openMVG_main_ComputeFeatures \
+--force 1 \
+-o $SEGMENT_DIR/openMVG/matches/ \
+-i $SEGMENT_DIR/openMVG/sfm_data.json \
+-n $NUM_THREADS \
+$COMPUTEFEATURES_OPTIONS
+EOF
+    openMVG_main_ComputeFeatures \
+      --force 1 \
+      -o $SEGMENT_DIR/openMVG/matches/ \
+      -i $SEGMENT_DIR/openMVG/sfm_data.json \
+      -n $NUM_THREADS \
+      $COMPUTEFEATURES_OPTIONS
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+       find $SEGMENT_DIR/openMVG/matches/ -maxdepth 1 -iname \*.feat -or -iname \*.desc -exec rm '{}' \; 2> /dev/null
+      errmsg openMVG_main_ComputeFeatures exited with status $EXIT_CODE
+    fi
+  fi
+}
+
+compute_matches() {
+  if [ -z "$FORCE" -a -n "$(find $SEGMENT_DIR/openMVG/matches/ -maxdepth 1 -name matches.putative.\* -print -quit)" ]
+  then
+    progress Matches already done
+  else
+    FORCE=true
+    progress openMVG_main_ComputeMatches
+    COMPUTEMATCHES_OPTIONS=${COMPUTEMATCHES_OPTIONS:-\
+      -g e \
+      -v 12 \
+    }
+    progress "options: $COMPUTEMATCHES_OPTIONS"
+    echo $COMPUTEMATCHES_OPTIONS > $SEGMENT_DIR/openMVG/COMPUTEMATCHES_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+openMVG_main_ComputeMatches \
+--force 1 \
+-i $SEGMENT_DIR/openMVG/sfm_data.json \
+-o $SEGMENT_DIR/openMVG/matches \
+$COMPUTEMATCHES_OPTIONS
+EOF
+    openMVG_main_ComputeMatches \
+      --force 1 \
+      -i $SEGMENT_DIR/openMVG/sfm_data.json \
+      -o $SEGMENT_DIR/openMVG/matches \
+      $COMPUTEMATCHES_OPTIONS
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+      find $SEGMENT_DIR/openMVG/matches/ -maxdepth 1 -iname matches.putative.\* -exec rm '{}' \; 2>/dev/null
+      errmsg "openMVG_main_ComputeMatches exited with status $EXIT_CODE"
+    fi
+  fi
+}
+
+global_sfm() {
+  if [ -z "$FORCE" -a -f $SEGMENT_DIR/openMVG/SfMReconstruction_Report.html ]
+  then
+    progress "GlobalSfM already done"
+  else
+    FORCE=true
+    progress openMVG_main_GlobalSfM
+    GLOBALSFM_OPTIONS=${GLOBALSFM_OPTIONS:-\
+    }
+    progress "options: $GLOBALSFM_OPTIONS"
+    echo $GLOBALSFM_OPTIONS > $SEGMENT_DIR/openMVG/GLOBALSFM_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+openMVG_main_GlobalSfM \
+-i $SEGMENT_DIR/openMVG/sfm_data.json \
+-m $SEGMENT_DIR/openMVG/matches \
+-o $SEGMENT_DIR/openMVG/ \
+$GLOBALSFM_OPTIONS
+EOF
+    openMVG_main_GlobalSfM \
+      -i $SEGMENT_DIR/openMVG/sfm_data.json \
+      -m $SEGMENT_DIR/openMVG/matches \
+      -o $SEGMENT_DIR/openMVG/ \
+      $GLOBALSFM_OPTIONS
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+       [ -f $SEGMENT_DIR/openMVG/SfMReconstruction_Report.html ] && rm $SEGMENT_DIR/openMVG/SfMReconstruction_Report.html
+      errmsg "openMVG_main_GlobalSfM exited with status $EXIT_CODE"
+    fi
+  fi
+}
+
+compute_structure_from_known_poses() {
+  if [ -z "$FORCE" -a -f $SEGMENT_DIR/openMVG/robust.ply ]
+  then
+    progress "Compute Structure From Known Poses already done"
+  else
+    [ -n "$FORCE" -a -f $SEGMENT_DIR/openMVG/robust.ply ] && rm $SEGMENT_DIR/openMVG/robust.ply
+    FORCE=true
+    progress openMVG_main_ComputeStructureFromKnownPoses
+    COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS=${COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS:-\
+    }
+    progress "options: $COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS"
+    echo $COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS > $SEGMENT_DIR/openMVG/COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+openMVG_main_ComputeStructureFromKnownPoses \
+-i $SEGMENT_DIR/openMVG/sfm_data.bin \
+-m $SEGMENT_DIR/openMVG/matches \
+-o $SEGMENT_DIR/openMVG/robust.json \
+$COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS
+EOF
+    openMVG_main_ComputeStructureFromKnownPoses \
+      -i $SEGMENT_DIR/openMVG/sfm_data.bin \
+      -m $SEGMENT_DIR/openMVG/matches \
+      -o $SEGMENT_DIR/openMVG/robust.json \
+      $COMPUTESTRUCTUREFROMKNOWNPOSES_OPTIONS
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+       [ -f $SEGMENT_DIR/openMVG/robust.ply ] && rm $SEGMENT_DIR/openMVG/robust.ply
+      errmsg "openMVG_main_ComputeStructureFromKnownPoses exited with status $EXIT_CODE"
+    fi
+  fi
+}
+
+openmvg2pmvs() {
+  if [ -z "$FORCE" -a -n "$(find $SEGMENT_DIR/PMVS/ -maxdepth 1 -name pmvs_options.txt -print -quit)" ]
+  then
+    progress "PMVS directory already exist"
+  else
+    [ -n "$FORCE" -a -d $SEGMENT_DIR/PMVS ] && rm -r $SEGMENT_DIR/PMVS
+    FORCE=true
+    progress openMVG_main_openMVG2PMVS
+    OPENMVG2PMVS_OPTIONS=${OPENMVG2PMVS_OPTIONS:-\
+    }
+    progress "options: $OPENMVG2PMVS_OPTIONS"
+    echo $OPENMVG2PMVS_OPTIONS > $SEGMENT_DIR/openMVG/OPENMVG2PMVS_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+openMVG_main_openMVG2PMVS \
+-i $SEGMENT_DIR/openMVG/robust.json \
+-o $SEGMENT_DIR \
+$OPENMVG2PMVS_OPTIONS
+EOF
+    openMVG_main_openMVG2PMVS \
+      -i $SEGMENT_DIR/openMVG/robust.json \
+      -o $SEGMENT_DIR \
+      $OPENMVG2PMVS_OPTIONS
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+       [ -d $SEGMENT_DIR/PMVS ] && rm -r $SEGMENT_DIR/PMVS
+      errmsg "openMVG_main_openMVG2PMVS exited with status $EXIT_CODE"
+    fi
+  fi
+}
+
+cmvspmvs() {
+  if [ -z "$FORCE" -a -n "$(find $SEGMENT_DIR/PMVS/models/ -type f -print -quit)" ]
+  then
+    progress "PMVS models directory already exist"
+  else
+    [ -n "$FORCE" -a -d $SEGMENT_DIR/PMVS/models ] && rm -r $SEGMENT_DIR/PMVS/models
+    FORCE=true
+    progress "Running CMVS"
+    progress "options: ${CMVS_MAXIMAGE:-80} ${CMVS_CPU:-$NUM_THREADS}"
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+cmvs $(pwd)/PMVS/ ${CMVS_MAXIMAGE:-80} ${CMVS_CPU:-$NUM_THREADS} && \
+genOption \
+$(pwd)/PMVS/ \
+${PMVS_LEVEL:-1} \
+${PMVS_CSIZE:-2} \
+${PMVS_THRESHOLD:-0.7} \
+${PMVS_WSIZE:-7} \
+${PMVS_MINIMAGENUM:-3} \
+${PMVS_CPU:-$NUM_THREADS} && \
+sed -i "s# pmvs# $(pwd)/PMVS#g" PMVS/pmvs.sh && \
+bash PMVS/pmvs.sh
+EOF
+    cmvs $(pwd)/PMVS/ ${CMVS_MAXIMAGE:-80} ${CMVS_CPU:-$NUM_THREADS} \
+    && progress "Running genOption" \
+    && progress "options: $(pwd)/PMVS/ ${PMVS_LEVEL:-1} ${PMVS_CSIZE:-2} ${PMVS_THRESHOLD:-0.7} ${PMVS_WSIZE:-7} ${PMVS_MINIMAGENUM:-3} ${PMVS_CPU:-$NUM_THREADS}" \
+    && genOption \
+         $(pwd)/PMVS/ \
+         ${PMVS_LEVEL:-1} \
+         ${PMVS_CSIZE:-2} \
+         ${PMVS_THRESHOLD:-0.7} \
+         ${PMVS_WSIZE:-7} \
+         ${PMVS_MINIMAGENUM:-3} \
+         ${PMVS_CPU:-$NUM_THREADS} \
+    && sed -i "s# pmvs# $(pwd)/PMVS#g" PMVS/pmvs.sh \
+    && progress "Running PMVS" \
+    && bash PMVS/pmvs.sh
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+      [ -d $SEGMENT_DIR/PMVS/models ] && rm -r $SEGMENT_DIR/PMVS/models
+      errmsg "CMVS/PMVS exited with status $EXIT_CODE"
+    fi
+    [ ! -d  $SEGMENT_DIR/PMVS/models ] && errmsg "PMVS did not produce any results"
+  fi
+  export PLY=$SEGMENT_DIR/PMVS/models/option-????.ply
+}
+
+openmvg2mve2() {
+  if [ -z "$FORCE" -a -n "$(find $SEGMENT_DIR/MVE/ -maxdepth 1 -name synth_0.out -print -quit)" ]
+  then
+    progress "MVE directory already exist"
+  else
+    [ -n "$FORCE" -a -d "$SEGMENT_DIR/MVE" ] && rm -r $SEGMENT_DIR/MVE
+    FORCE=true
+    progress openMVG_main_openMVG2MVE2
+    OPENMVG2MVE2_OPTIONS=${OPENMVG2MVE2_OPTIONS:-\
+    }
+    progress "options: $OPENMVG2MVE2_OPTIONS"
+    echo $OPENMVG2MVE2_OPTIONS > $SEGMENT_DIR/openMVG/OPENMVG2MVE2_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+openMVG_main_openMVG2MVE2 \
+-i $SEGMENT_DIR/openMVG/robust.json \
+-o $SEGMENT_DIR \
+$OPENMVG2MVE2_OPTIONS
+EOF
+    openMVG_main_openMVG2MVE2 \
+      -i $SEGMENT_DIR/openMVG/robust.json \
+      -o $SEGMENT_DIR \
+      $OPENMVG2MVE2_OPTIONS
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+       [ -d $SEGMENT_DIR/MVE ] && rm -r $SEGMENT_DIR/MVE
+      errmsg "openMVG_main_openMVG2MVE2 exited with status $EXIT_CODE"
+    fi
+  fi
+}
+
+smvsrecon() {
+  if [ -z "$FORCE" -a -f $SEGMENT_DIR/MVE/smvs-B1.ply ]
+  then
+    progress "SMVS already done"
+  else
+    [ -n "$FORCE" -a -f $SEGMENT_DIR/MVE/smvs-B1.ply ] && rm $SEGMENT_DIR/MVE/smvs-B1.ply
+    FORCE=true
+    progress Running smvsrecon
+    SMVSRECON_OPTIONS=${SMVSRECON_OPTIONS:-\
+      --scale=1 \
+      --output-scale=2 \
+      --alpha=1.0 \
+    }
+    progress "options: $SMVSRECON_OPTIONS"
+    echo $SMVSRECON_OPTIONS > $SEGMENT_DIR/MVE/SMVSRECON_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+$(which smvsrecon) \
+$SMVSRECON_OPTIONS \
+$SEGMENT_DIR/MVE
+EOF
+    $(which smvsrecon) \
+      $SMVSRECON_OPTIONS \
+      $SEGMENT_DIR/MVE
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+      [ -f $SEGMENT_DIR/MVE/smvs-B1.ply ] && rm $SEGMENT_DIR/MVE/smvs-B1.ply
+      errmsg "smvsrecon exited with status $EXIT_CODE"
+    fi
+  fi
+  export PLY=$SEGMENT_DIR/MVE/smvs-B1.ply
+}
+
+fssrecon() {
+  if [ -z "$FORCE" -a -f $SEGMENT_DIR/MVE/surface_model.ply ]
+  then
+    progress "FSS already done"
+  else
+    [ -n "$FORCE" -a -f $SEGMENT_DIR/MVE/surface_model.ply ] && rm $SEGMENT_DIR/MVE/surface_model.ply
+    FORCE=true
+    progress Running fssrecon
+    FSSRECON_OPTIONS=${FSSRECON_OPTIONS:-\
+      --scale-factor=1 \
+      --refine-octree=0 \
+    }
+    progress "options: $FSSRECON_OPTIONS"
+    echo $FSSRECON_OPTIONS > $SEGMENT_DIR/MVE/FSSRECON_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+$(which fssrecon) \
+$FSSRECON_OPTIONS \
+$SEGMENT_DIR/MVE/smvs-B1.ply \
+$SEGMENT_DIR/MVE/surface_model.ply
+EOF
+    $(which fssrecon) \
+      $FSSRECON_OPTIONS \
+      $SEGMENT_DIR/MVE/smvs-B1.ply \
+      $SEGMENT_DIR/MVE/surface_model.ply
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+      [ -f $SEGMENT_DIR/MVE/surface_model.ply ] && rm $SEGMENT_DIR/MVE/surface_model.ply
+      errmsg "fssrecon exited with status $EXIT_CODE"
+    fi
+  fi
+  export PLY=$SEGMENT_DIR/MVE/surface_model.ply
+}
+
+meshclean() {
+  if [ -z "$FORCE" -a -f $SEGMENT_DIR/MVE/surface_clean_model.ply ]
+  then
+    progress "meshclean already done"
+  else
+    [ -f $SEGMENT_DIR/MVE/surface_clean_model.ply ] && rm $SEGMENT_DIR/MVE/surface_clean_model.ply
+    FORCE=true
+    progress Running meshclean
+    MESHCLEAN_OPTIONS=${MESHCLEAN_OPTIONS:-\
+      --threshold=1 \
+      --component-size=1024 \
+    }
+    progress "options: $MESHCLEAN_OPTIONS"
+    echo $MESHCLEAN_OPTIONS > $SEGMENT_DIR/MVE/MESHCLEAN_OPTIONS
+sed -r -e 's/ +/ /g' << EOF | tee -a $JOB_DIR/script.sh
+$(which meshclean) \
+$MESHCLEAN_OPTIONS \
+$SEGMENT_DIR/MVE/surface_model.ply \
+$SEGMENT_DIR/MVE/surface_clean_model.ply
+EOF
+    $(which meshclean) \
+      $MESHCLEAN_OPTIONS \
+      $SEGMENT_DIR/MVE/surface_model.ply \
+      $SEGMENT_DIR/MVE/surface_clean_model.ply
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+      [ -f $SEGMENT_DIR/MVE/surface_clean_model.ply ] && rm $SEGMENT_DIR/MVE/surface_clean_model.ply
+      errmsg "meshclean exited with status $EXIT_CODE"
+    fi
+  fi
+  export PLY=$SEGMENT_DIR/MVE/surface_clean_model.ply
+}
+
+assert_hasPoints() {
+  TOTAL=0
+  while [ -f $1 ] ; do
+    f=$1
+    shift
+    VERTEX_COUNT=$(grep --text element.vertex $f | awk '{print $NF}')
+    if [ -z "$VERTEX_COUNT" ] ; then
+      errmsg "Cannot read \"element vertex\" property from $f"
+    fi
+    TOTAL=$((TOTAL+VERTEX_COUNT))
+  done
+  if [ $TOTAL -lt $1 ] ; then
+    errmsg "Pointcloud discarded: $TOTAL points"
+    exit
+  fi
+}
+
+viewer() {
+  if [ -z "$FORCE" -a -d $SEGMENT_DIR/potree ]
+  then
+    progress "Potree directory already exist"
+  else
+    [ -n "$FORCE" ] && {
+      [ -d $SEGMENT_DIR/potree ] && {
+        i=0
+        while [ -d $SEGMENT_DIR/potree.$i ] ; do ((++i)) ; done
+        progress renaming potree/ to potree.$i
+        mv $SEGMENT_DIR/potree $SEGMENT_DIR/potree.$i
+        [ -d $SEGMENT_DIR/viewer ] && {
+          progress renaming viewer/ to viewer.$i
+          mv $SEGMENT_DIR/viewer $SEGMENT_DIR/viewer.$i
+        }
+      }
+    }
+    FORCE=true
+    progress "Running viewer.sh"
+    viewer.sh
+
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ] ; then
+       [ -d $SEGMENT_DIR/potree ] && rm -r $SEGMENT_DIR/potree
+       [ -d $SEGMENT_DIR/viewer ] && rm -r $SEGMENT_DIR/viewer
+      errmsg "viewer.sh exited with status $EXIT_CODE" >&2
+    fi
+
+  fi
+}
+
+inject() {
+  progress Injecting pointcloud into database
+  doxel-segment-inject-pointcloud \
+    --no-check-certificate \
+    -a $AUTHORIZATION \
+    -s $SEGMENT_ID \
+    $URL
+
+  EXIT_CODE=$?
+  if [ $EXIT_CODE -ne 0 ] ; then
+    errmsg "doxel-segment-pointcloud-inject exited with status $EXIT_CODE" >&2
+  fi
+
+}
+
+completed(){
+  progress "Set job as completed"
+  log '{"completed": true, "msg": "'$2'", "t": '$1'}' || exit
+}
+
+sfm() {
+  compute_matches
+  global_sfm
+}
+
+densify() {
+  local method
+  method=$(jq -r .result.job.config.densification_method <<< $RESULT)
+  case "$method" in
+    pmvs)
+      openmvg2pmvs
+      cmvspmvs
+      progress "Assert PMVS pointcloud has points"
+      assert_hasPoints PMVS/models/option-????.ply $REQUIRED_POINTS_AFTER_DENSIFICATION
+      ;;
+    *)
+      progress "viewer needs undistorted images in PMVS/ directory"
+      openmvg2pmvs # viewer needs undistorted images in PMVS/ directory
+      openmvg2mve2
+      smvsrecon
+      progress "Assert SMVS pointcloud has points"
+      assert_hasPoints MVE/smvs-B1.ply $REQUIRED_POINTS_AFTER_DENSIFICATION
+      fssrecon
+      meshclean
+      ;;
+  esac
+
+}
+
+process_segment() {
+  [ -n "$DEBUG" ] && set -x
+  SEGMENT_DIR=$1
+  cd $SEGMENT_DIR || errmsg "no such directory: $SEGMENT_DIR"
+  progress "$SEGMENT_DIR"
+
+  progress "Fix EXIFs"
+  for f in original_images/*jpeg ; do exiftool -all= -tagsfromfile @ -all:all -unsafe -icc_profile $f ; done
+  rm original_images/*original
+
+  assert_cameraModelInDatabase
+  sfm_init
+  compute_features
+  sfm
+  compute_structure_from_known_poses
+  progress "Assert openMVG pointcloud has points"
+  assert_hasPoints openMVG/robust.ply $REQUIRED_POINTS_AFTER_OPENMVG
+  densify
+  viewer
+  inject
+  completed $(date +%s000) ok
+}
+
+process_segment $SEGMENT_DIR
+
+} 2>&1 | ts "$DATE_FORMAT" | tee -a $SEGMENT_DIR/LOG $JOB_DIR/LOG.txt
